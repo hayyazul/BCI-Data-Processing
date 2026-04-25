@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "quad_decimate": 0.5,
+    "quad_sigma": 0.3,
+    "refine_edges": true,
+    "decode_sharpening": 0.1,
+    "nthreads": 1,
+    "decision_margin_threshold": 0.0
+  },
+  "brightness": 0,
+  "contrast": 1.0,
+  "gamma": 1.0,
+  "clahe": false,
+  "single_tag_mode": true,
+  "speed": 1.0,
+  "loop": false
+}

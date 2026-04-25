@@ -12,6 +12,7 @@ from models import (Position, get_camera_intrinsics,
                     tag_facing_back, tag_facing_up, tag_facing_down)
 from estimator import MonocularPoseEstimator
 from visualization import SimplePlotUpdater, show_playback
+from playback_mode import run_playback, run_accept
 
 warnings.filterwarnings("ignore", message=".*more than one new minima.*")
 
@@ -249,9 +250,9 @@ def _build_default_positions(tag_size=0.0762):
     half_thickness_x = 2.0 * inch
 
     bracelet = Position("bracelet", [
-        tag_facing_up   (tag_id=7,  offset=[0,  half_thickness_y, 0], tag_size=tag_size),
-        tag_facing_down (tag_id=9,  offset=[0, -half_thickness_y, 0], tag_size=tag_size),
-        tag_facing_left (tag_id=2,  offset=[-half_thickness_x, 0, 0], tag_size=tag_size),
+        tag_facing_up   (tag_id=7,  offset=[0, 0, half_thickness_x], tag_size=tag_size),
+        # tag_facing_left (tag_id=2,  offset=[-half_thickness_x, 0, 0], tag_size=tag_size),
+        tag_facing_forward (tag_id=10,  offset=[0, 0, half_thickness_y], tag_size=tag_size)
     ])
     elbow = Position("elbow", [
         tag_facing_up   (tag_id=1,  offset=[0,  half_thickness_y, 0], tag_size=tag_size),
@@ -259,23 +260,46 @@ def _build_default_positions(tag_size=0.0762):
         tag_facing_left (tag_id=6,  offset=[-half_thickness_x, 0, 0], tag_size=tag_size),
     ])
     shoulder = Position("shoulder", [
-        tag_facing_forward(tag_id=8, offset=[0, 0, 0], tag_size=tag_size),
+        tag_facing_forward(tag_id=8, offset=[0, 0, 0], tag_size=tag_size)
+        # tag_facing_forward(tag_id=9, offset=[0, 0, 0], tag_size=tag_size),
     ])
     return [bracelet, elbow, shoulder]
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AprilTag tracker / recorder")
-    parser.add_argument("--mode", choices=["visualize", "record"], default="visualize",
-                        help="visualize: live 3D plot + tag detection. record: raw video only.")
+    parser.add_argument("--mode", choices=["visualize", "record", "playback", "accept"],
+                        default="visualize",
+                        help="visualize: live camera + 3D plot. "
+                             "record: raw video only. "
+                             "playback: replay a video with a live tuner UI. "
+                             "accept: batch-process video with saved settings -> labeled CSV.")
     parser.add_argument("--camera", type=int, default=0, help="camera index")
     parser.add_argument("--hfov", type=float, default=70, help="camera horizontal FOV in degrees")
-    parser.add_argument("--output", type=str, default=".",
-                        help="output directory for record mode")
+    parser.add_argument("--output", type=str, default=None,
+                        help="record: output directory. "
+                             "accept: output CSV path or directory (defaults next to video).")
+    parser.add_argument("--video", type=str, default=None,
+                        help="path to a recorded video (required for playback / accept modes)")
+    parser.add_argument("--config", type=str, default="playback_config.json",
+                        help="JSON config file for playback-mode tuner settings "
+                             "(also consumed by accept mode)")
     args = parser.parse_args()
 
     if args.mode == "record":
-        run_record(camera_id=args.camera, output_dir=args.output)
+        run_record(camera_id=args.camera, output_dir=args.output or ".")
+    elif args.mode == "playback":
+        if not args.video:
+            parser.error("--video is required for playback mode")
+        positions = _build_default_positions()
+        run_playback(args.video, positions, config_path=args.config,
+                     hfov_deg=args.hfov, buffer_seconds=10)
+    elif args.mode == "accept":
+        if not args.video:
+            parser.error("--video is required for accept mode")
+        positions = _build_default_positions()
+        run_accept(args.video, positions, config_path=args.config,
+                   hfov_deg=args.hfov, output=args.output)
     else:
         positions = _build_default_positions()
         run_tracking(positions, camera_id=args.camera, hfov_deg=args.hfov,
