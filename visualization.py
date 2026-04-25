@@ -8,19 +8,11 @@ import matplotlib.pyplot as plt
 from models import PositionEstimate
 
 
-# ==============================================================================
-# SIMPLE PLOT UPDATER (manually update simple plot every N frames)
-# ==============================================================================
-
 class SimplePlotUpdater:
-    """
-    Real-time 3D position plot. Pre-creates Line3D / scatter artists per
-    position and updates their data each tick instead of clearing+redrawing.
-    Throttled by wall-clock so the plot can't starve the camera loop.
-    """
-    def __init__(self, position_names: List[str], buffer_seconds=10):
+    def __init__(self, position_names: List[str], buffer_seconds=10, hfov_deg=70):
         self.position_names = position_names
         self.buffer_seconds = buffer_seconds
+        self.hfov_deg = hfov_deg
         self.history = {name: deque(maxlen=5000) for name in position_names}
         self.start_time = None
         self.last_plot_update = 0.0
@@ -37,17 +29,19 @@ class SimplePlotUpdater:
         self.ax_3d.set_zlabel('Z (m)')
         self.ax_3d.set_title('Live 3D Position')
         self.ax_3d.invert_yaxis()
+
+        # Camera marker at origin
         self.ax_3d.scatter([0], [0], [0], c='black', s=80, marker='^', label='Camera')
+
+        # Camera FOV cone (apex at origin, axis along +Z = camera forward)
+        self._draw_view_cone(hfov_deg=hfov_deg, length=0.4)
 
         self.lines = {}
         self.markers = {}
         for name in position_names:
             color = self.color_map[name]
             line, = self.ax_3d.plot([], [], [], color=color, linewidth=1.5, alpha=0.85, label=name)
-            # Marker as a Line3D with no line — 3D scatter's _offsets3d hack
-            # leaves the internal facecolor array unsized, so the dot never renders.
-            marker, = self.ax_3d.plot([], [], [], color=color, marker='o',
-                                       markersize=8, linestyle='None')
+            marker = self.ax_3d.scatter([], [], [], color=[color], s=40, marker='o')
             self.lines[name] = line
             self.markers[name] = marker
 
@@ -59,6 +53,30 @@ class SimplePlotUpdater:
         plt.tight_layout()
         plt.show(block=False)
         plt.pause(0.05)
+
+    def _draw_view_cone(self, hfov_deg: float, length: float):
+        half_angle = np.radians(hfov_deg) / 2
+        radius = length * np.tan(half_angle)
+
+        # Edge lines from apex (camera) to base circle
+        n_edges = 12
+        for i in range(n_edges):
+            a = 2 * np.pi * i / n_edges
+            self.ax_3d.plot([0, radius * np.cos(a)],
+                            [0, radius * np.sin(a)],
+                            [0, length],
+                            color='red', alpha=0.25, linewidth=0.7)
+
+        # Base circle of the cone
+        t = np.linspace(0, 2 * np.pi, 60)
+        self.ax_3d.plot(radius * np.cos(t), radius * np.sin(t),
+                        np.full_like(t, length),
+                        color='red', alpha=0.7, linewidth=1.2,
+                        label=f'Camera FOV ({hfov_deg:.0f}°)')
+
+        # Centerline so the facing direction reads even when the cone is small on-screen
+        self.ax_3d.plot([0, 0], [0, 0], [0, length],
+                        color='red', alpha=0.6, linewidth=1.5)
 
     def add_point(self, name: str, x: float, y: float, z: float, timestamp: float):
         if self.start_time is None:
@@ -90,7 +108,8 @@ class SimplePlotUpdater:
             recent = [h for h in hist if h['t'] >= cutoff]
             if not recent:
                 self.lines[name].set_data_3d(empty, empty, empty)
-                self.markers[name].set_data_3d(empty, empty, empty)
+                self.markers[name]._offsets3d = (empty, empty, empty)
+                self.markers[name].stale = True
                 continue
 
             xs = np.array([h['x'] for h in recent])
@@ -98,7 +117,8 @@ class SimplePlotUpdater:
             zs = np.array([h['z'] for h in recent])
 
             self.lines[name].set_data_3d(xs, ys, zs)
-            self.markers[name].set_data_3d(xs[-1:], ys[-1:], zs[-1:])
+            self.markers[name]._offsets3d = (xs[-1:], ys[-1:], zs[-1:])
+            self.markers[name].stale = True
 
             d = float(np.sqrt(xs**2 + ys**2 + zs**2).max())
             if d > max_dist:
@@ -111,11 +131,10 @@ class SimplePlotUpdater:
             self.ax_3d.set_ylim([-target, target])
             self.ax_3d.set_zlim([0, max_dist * 1.5])
 
-        # --- CHANGED: force a full redraw instead of idle draw ---
         try:
-            self.fig.canvas.draw()                # immediate redraw
+            self.fig.canvas.draw()
             self.fig.canvas.flush_events()
-            plt.pause(0.001)                      # let the GUI breathe
+            plt.pause(0.001)
         except Exception:
             pass
 
@@ -123,10 +142,6 @@ class SimplePlotUpdater:
         plt.ioff()
         plt.close('all')
 
-
-# ==============================================================================
-# PLAYBACK - unchanged
-# ==============================================================================
 
 def show_playback(records: List[PositionEstimate], start_time: float):
     if not records:
@@ -166,7 +181,6 @@ def show_playback(records: List[PositionEstimate], start_time: float):
     
     plt.tight_layout()
     
-    # Summary
     print(f"\n=== Playback ===")
     print(f"Frames: {len(records)}")
     for name, recs in by_name.items():

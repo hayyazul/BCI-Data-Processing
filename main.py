@@ -1,6 +1,8 @@
+import argparse
 import cv2
 import numpy as np
 from collections import deque
+import os
 import time
 import warnings
 from typing import List
@@ -46,7 +48,9 @@ def run_tracking(positions: List[Position], camera_id=0, hfov_deg=70,
                   f"offset=({off[0]:.3f},{off[1]:.3f},{off[2]:.3f})m")
     
     # Create plot updater
-    plotter = SimplePlotUpdater([p.name for p in positions], buffer_seconds=buffer_seconds)
+    plotter = SimplePlotUpdater([p.name for p in positions],
+                                buffer_seconds=buffer_seconds,
+                                hfov_deg=hfov_deg)
     
     # State
     recording = False
@@ -148,33 +152,131 @@ def run_tracking(positions: List[Position], camera_id=0, hfov_deg=70,
 
 
 # ==============================================================================
+# RECORD MODE
+# ==============================================================================
+
+def run_record(camera_id=0, output_dir="."):
+    """Capture raw video for offline AprilTag detection.
+
+    Writes MJPEG-in-AVI: every frame is intra-coded, so detection quality is
+    uniform across the file and there are no inter-frame compression artifacts
+    that confuse the tag decoder. Sidecar CSV records the Unix timestamp of
+    each frame's capture, since the file's nominal FPS rarely matches reality.
+    """
+    cap = cv2.VideoCapture(camera_id)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera {camera_id}")
+
+    # Ask the camera to deliver MJPG natively — most webcams expose higher
+    # FPS in MJPG than in raw YUV, and we're going to re-encode as MJPG anyway.
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    nominal_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+    start_unix = time.time()
+    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.join(output_dir, f"recording_{int(start_unix)}")
+    video_path = base + ".avi"
+    times_path = base + "_timestamps.csv"
+
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    writer = cv2.VideoWriter(video_path, fourcc, nominal_fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not open VideoWriter for {video_path}")
+
+    times_file = open(times_path, "w", buffering=1)  # line-buffered: survives crashes
+    times_file.write("frame,unix_timestamp\n")
+
+    print(f"Recording {width}x{height} @ {nominal_fps:.0f} fps (nominal) -> {video_path}")
+    print(f"Timestamps -> {times_path}")
+    print(f"Start (Unix): {start_unix:.6f}")
+    print("Q = stop\n")
+
+    fps_buf = deque(maxlen=30)
+    last_t = start_unix
+    frame_idx = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Camera read failed.")
+                break
+
+            now = time.time()
+            writer.write(frame)
+            times_file.write(f"{frame_idx},{now:.6f}\n")
+            frame_idx += 1
+
+            fps_buf.append(1.0 / max(now - last_t, 1e-6))
+            last_t = now
+
+            # Minimal overlay on a copy so the recorded file stays clean.
+            preview = frame.copy()
+            elapsed = now - start_unix
+            cv2.putText(preview,
+                        f"REC {elapsed:6.1f}s  FPS:{np.mean(fps_buf):4.1f}  frames:{frame_idx}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(preview, "Q to stop",
+                        (10, height - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.imshow("Recording (raw frames written to disk)", preview)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        end_t = time.time()
+        writer.release()
+        times_file.close()
+        cap.release()
+        cv2.destroyAllWindows()
+        dur = end_t - start_unix
+        avg_fps = frame_idx / dur if dur > 0 else 0.0
+        print(f"\nStopped. {frame_idx} frames in {dur:.2f}s ({avg_fps:.1f} fps avg)")
+        print(f"Video:      {video_path}")
+        print(f"Timestamps: {times_path}")
+
+
+# ==============================================================================
 # CONFIG / ENTRY POINT
 # ==============================================================================
 
-if __name__ == "__main__":
-    CAMERA_ID = 0
-    CAMERA_HFOV = 70
-    TAG_SIZE = 0.0762  # 3 inches – adjust to your actual printed tag size
-
-    # Bracelet geometry (all dimensions in meters)
+def _build_default_positions(tag_size=0.0762):
     inch = 0.0254
-    half_thickness_y = 1.5 * inch   # 3-inch sides are 1.5 in from centre
-    half_thickness_x = 2.0 * inch   # 2-inch sides are 2.0 in from centre
+    half_thickness_y = 1.5 * inch
+    half_thickness_x = 2.0 * inch
 
     bracelet = Position("bracelet", [
-        # ID 7 – long side, +Y direction (up)
-        tag_facing_up   (tag_id=7,  offset=[0,  half_thickness_y, 0], tag_size=TAG_SIZE),
-        # ID 10 – short side, +X direction (right)
-        tag_facing_right(tag_id=10, offset=[ half_thickness_x, 0, 0], tag_size=TAG_SIZE),
-        # ID 9 – long side, -Y direction (down)
-        tag_facing_down (tag_id=9,  offset=[0, -half_thickness_y, 0], tag_size=TAG_SIZE),
-        # ID 2 – short side, -X direction (left)
-        tag_facing_left (tag_id=2,  offset=[-half_thickness_x, 0, 0], tag_size=TAG_SIZE),
+        tag_facing_up   (tag_id=7,  offset=[0,  half_thickness_y, 0], tag_size=tag_size),
+        tag_facing_down (tag_id=9,  offset=[0, -half_thickness_y, 0], tag_size=tag_size),
+        tag_facing_left (tag_id=2,  offset=[-half_thickness_x, 0, 0], tag_size=tag_size),
     ])
-
+    elbow = Position("elbow", [
+        tag_facing_up   (tag_id=1,  offset=[0,  half_thickness_y, 0], tag_size=tag_size),
+        tag_facing_down (tag_id=0,  offset=[0, -half_thickness_y, 0], tag_size=tag_size),
+        tag_facing_left (tag_id=6,  offset=[-half_thickness_x, 0, 0], tag_size=tag_size),
+    ])
     shoulder = Position("shoulder", [
-        tag_facing_forward (tag_id=1,  offset=[0, 0, 0], tag_size=TAG_SIZE),
+        tag_facing_forward(tag_id=8, offset=[0, 0, 0], tag_size=tag_size),
     ])
+    return [bracelet, elbow, shoulder]
 
-    run_tracking([bracelet, shoulder], camera_id=CAMERA_ID, hfov_deg=CAMERA_HFOV,
-                 motion_optimized=True, buffer_seconds=10)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AprilTag tracker / recorder")
+    parser.add_argument("--mode", choices=["visualize", "record"], default="visualize",
+                        help="visualize: live 3D plot + tag detection. record: raw video only.")
+    parser.add_argument("--camera", type=int, default=0, help="camera index")
+    parser.add_argument("--hfov", type=float, default=70, help="camera horizontal FOV in degrees")
+    parser.add_argument("--output", type=str, default=".",
+                        help="output directory for record mode")
+    args = parser.parse_args()
+
+    if args.mode == "record":
+        run_record(camera_id=args.camera, output_dir=args.output)
+    else:
+        positions = _build_default_positions()
+        run_tracking(positions, camera_id=args.camera, hfov_deg=args.hfov,
+                     motion_optimized=True, buffer_seconds=10)
