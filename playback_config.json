@@ -11,7 +11,7 @@
   "contrast": 1.0,
   "gamma": 1.0,
   "clahe": false,
-  "single_tag_mode": true,
-  "speed": 1.0,
+  "single_tag_mode": false,
+  "speed": 4.0,
   "loop": false
 }

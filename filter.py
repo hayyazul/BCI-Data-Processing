@@ -7,12 +7,14 @@ to produce more stable and realistic motion tracking data.
 
 Usage:
     python smooth_poses.py input.csv [options]
+    python smooth_poses.py "camera0_20260425_*_poses.csv" [options]
     
 Examples:
     python smooth_poses.py pose_data.csv
-    python smooth_poses.py pose_data.csv -o smoothed_poses.csv
-    python smooth_poses.py pose_data.csv --disable-anatomical --min-confidence 50
-    python smooth_poses.py pose_data.csv --window-size 7 --butter-cutoff 4
+    python smooth_poses.py "camera0_20260425_*_poses.csv"
+    python smooth_poses.py "data/*_poses.csv" -o smoothed/
+    python smooth_poses.py "*.csv" --disable-anatomical --min-confidence 50
+    python smooth_poses.py camera0_20260425_poses.csv camera0_20260426_poses.csv -o smoothed/
 """
 
 import pandas as pd
@@ -21,6 +23,8 @@ from scipy.signal import butter, filtfilt
 from scipy.interpolate import interp1d
 import argparse
 import sys
+import glob
+import os
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
@@ -32,7 +36,8 @@ class PoseSmoothingPipeline:
                  disable_confidence_filter=False, disable_outlier_removal=False,
                  disable_interpolation=False, disable_confidence_weighted=False,
                  disable_butterworth=False, disable_anatomical=False,
-                 disable_quality_check=False):
+                 disable_quality_check=False, enable_elbow_correction=False, 
+                 true_upper_arm_length_in=14, true_forearm_length=10):
         """
         Initialize the smoothing pipeline with configurable parameters.
         
@@ -60,7 +65,11 @@ class PoseSmoothingPipeline:
         self.enable_butterworth = not disable_butterworth
         self.enable_anatomical = not disable_anatomical
         self.enable_quality_check = not disable_quality_check
-        
+        self.enable_elbow_correction = enable_elbow_correction
+        # Known arm lengths in metres (14 and 10 inches)
+        self.TRUE_UPPER_ARM_LENGTH = true_upper_arm_length_in * 0.0254
+        self.TRUE_FOREARM_LENGTH = true_forearm_length * 0.0254
+          
     def load_data(self, filepath):
         """Load CSV data and prepare for processing"""
         self.df = pd.read_csv(filepath)
@@ -77,28 +86,25 @@ class PoseSmoothingPipeline:
     def filter_low_confidence(self):
         """Replace low confidence measurements with NaN for interpolation"""
         if not self.enable_confidence_filter:
-            print("Skipping confidence filtering (disabled)")
+            print("  Skipping confidence filtering (disabled)")
             return self.df
             
         low_conf_mask = self.df['confidence'] < self.min_confidence
         
-        # Log how many points are being filtered
         n_filtered = low_conf_mask.sum()
         if n_filtered > 0:
-            print(f"Filtering {n_filtered} low confidence points (< {self.min_confidence}%)")
-            
-            # Set coordinates to NaN for low confidence points
+            print(f"  Filtering {n_filtered} low confidence points (< {self.min_confidence}%)")
             for coord in ['x', 'y', 'z']:
                 self.df.loc[low_conf_mask, coord] = np.nan
         else:
-            print("No low confidence points found")
+            print("  No low confidence points found")
         
         return self.df
     
     def remove_outliers(self):
         """Detect and remove temporal outliers using velocity threshold"""
         if not self.enable_outlier_removal:
-            print("Skipping outlier removal (disabled)")
+            print("  Skipping outlier removal (disabled)")
             return self.df
             
         outlier_count = 0
@@ -110,35 +116,29 @@ class PoseSmoothingPipeline:
             for coord in ['x', 'y', 'z']:
                 series = self.df.loc[position_indices, coord].copy()
                 
-                # Calculate velocity (first derivative)
                 velocity = series.diff()
-                
-                # Calculate acceleration (second derivative) - better for detecting jerks
                 acceleration = velocity.diff()
                 
-                # Detect outliers using both velocity and acceleration
                 vel_threshold = self.outlier_std * velocity.std()
                 acc_threshold = self.outlier_std * acceleration.std()
                 
                 outlier_mask = (np.abs(velocity) > vel_threshold) | \
                               (np.abs(acceleration) > acc_threshold)
                 
-                # Don't flag the first two frames (no velocity/acceleration data)
                 outlier_mask.iloc[:2] = False
                 
                 n_outliers = outlier_mask.sum()
                 if n_outliers > 0:
                     outlier_count += n_outliers
-                    # Set outliers to NaN for interpolation
                     self.df.loc[position_indices[outlier_mask], coord] = np.nan
         
-        print(f"Removed {outlier_count} outliers ({self.outlier_std} std threshold)")
+        print(f"  Removed {outlier_count} outliers ({self.outlier_std} std threshold)")
         return self.df
     
     def interpolate_missing(self):
         """Interpolate NaN values using cubic spline interpolation"""
         if not self.enable_interpolation:
-            print("Skipping interpolation (disabled)")
+            print("  Skipping interpolation (disabled)")
             return self.df
             
         interpolated_count = 0
@@ -154,61 +154,50 @@ class PoseSmoothingPipeline:
                 if nan_mask.any():
                     interpolated_count += nan_mask.sum()
                     
-                    # Create interpolation function based on valid points
                     valid_indices = np.arange(len(series))[~nan_mask]
                     valid_values = series[~nan_mask].values
                     
-                    if len(valid_indices) > 3:  # Need at least 4 points for cubic spline
-                        # Use cubic spline interpolation
+                    if len(valid_indices) > 3:
                         try:
                             f = interp1d(valid_indices, valid_values, 
                                        kind='cubic', fill_value='extrapolate')
                             interpolated_values = f(np.arange(len(series)))
-                            
-                            # Only replace NaN values
                             series[nan_mask] = interpolated_values[nan_mask]
-                        except Exception as e:
-                            # Fallback to linear for problematic data
+                        except Exception:
                             series = series.interpolate(method='linear')
                             series = series.fillna(method='bfill').fillna(method='ffill')
                     else:
-                        # Fallback to linear interpolation for small gaps
                         series = series.interpolate(method='linear')
                         series = series.fillna(method='bfill').fillna(method='ffill')
                     
                     self.df.loc[position_indices, coord] = series
         
-        print(f"Interpolated {interpolated_count} missing values")
+        print(f"  Interpolated {interpolated_count} missing values")
         return self.df
     
     def confidence_weighted_smooth(self):
         """Apply confidence-weighted moving average smoothing"""
         if not self.enable_confidence_weighted:
-            print("Skipping confidence-weighted smoothing (disabled)")
+            print("  Skipping confidence-weighted smoothing (disabled)")
             return self.df
             
         for position in self.df['position_name'].unique():
             mask = self.df['position_name'] == position
             position_indices = self.df[mask].index
             
-            # Get confidence values
             confidences = self.df.loc[position_indices, 'confidence'].values / 100.0
             
             for coord in ['x', 'y', 'z']:
                 values = self.df.loc[position_indices, coord].values
                 smoothed = np.zeros_like(values)
                 
-                # Apply confidence-weighted moving average
                 for i in range(len(values)):
-                    # Define window boundaries
                     start = max(0, i - self.window_size // 2)
                     end = min(len(values), i + self.window_size // 2 + 1)
                     
-                    # Extract window
                     window_values = values[start:end]
                     window_conf = confidences[start:end]
                     
-                    # Weight by confidence
                     if window_conf.sum() > 0:
                         smoothed[i] = np.average(window_values, weights=window_conf)
                     else:
@@ -216,29 +205,26 @@ class PoseSmoothingPipeline:
                 
                 self.df.loc[position_indices, coord] = smoothed
         
-        print(f"Applied confidence-weighted smoothing (window: {self.window_size})")
+        print(f"  Applied confidence-weighted smoothing (window: {self.window_size})")
         return self.df
     
     def butterworth_filter(self):
         """Apply Butterworth low-pass filter for final temporal smoothing"""
         if not self.enable_butterworth:
-            print("Skipping Butterworth filter (disabled)")
+            print("  Skipping Butterworth filter (disabled)")
             return self.df
             
-        # Design the filter
         nyquist = self.fps / 2
         normal_cutoff = self.butter_cutoff / nyquist
         
-        # Ensure cutoff is valid
         if normal_cutoff >= 1.0:
-            print(f"Warning: Cutoff frequency ({self.butter_cutoff} Hz) is too high for fps ({self.fps}). Reducing cutoff.")
+            print(f"  Warning: Cutoff frequency ({self.butter_cutoff} Hz) too high for fps ({self.fps})")
             normal_cutoff = 0.99
         
         try:
             b, a = butter(self.butter_order, normal_cutoff, btype='low')
         except Exception as e:
-            print(f"Error designing Butterworth filter: {e}")
-            print("Skipping Butterworth filter")
+            print(f"  Error designing Butterworth filter: {e}")
             return self.df
         
         for position in self.df['position_name'].unique():
@@ -248,46 +234,89 @@ class PoseSmoothingPipeline:
             for coord in ['x', 'y', 'z']:
                 signal = self.df.loc[position_indices, coord].values
                 
-                # Need at least 15 points for the filter to work well
                 if len(signal) > 15:
-                    # Apply zero-phase filtering
                     try:
                         filtered = filtfilt(b, a, signal)
                         self.df.loc[position_indices, coord] = filtered
                     except Exception as e:
-                        print(f"Warning: Butterworth filter failed for {position}/{coord}: {e}")
+                        print(f"  Warning: Butterworth filter failed for {position}/{coord}: {e}")
         
-        print(f"Applied Butterworth low-pass filter (cutoff: {self.butter_cutoff} Hz, order: {self.butter_order})")
+        print(f"  Applied Butterworth low-pass filter (cutoff: {self.butter_cutoff} Hz, order: {self.butter_order})")
+        return self.df
+
+    def correct_elbow_position(self):
+        """
+        Correct the elbow tag position by extrapolating it along the
+        shoulder‑to‑tag ray to exactly match the known upper arm length.
+        This compensates for the tag being offset a few inches proximal to the
+        true elbow joint.
+        """
+        if not self.enable_elbow_correction:
+            print("  Note: Elbow position correction is disabled. Use --correct-elbow for better anatomical accuracy.")
+            return self.df
+    
+        n_corrected = 0
+        shoulder_pos = None
+        elbow_pos = None
+    
+        # We'll work on a copy to avoid chained indexing warnings
+        df = self.df.copy()
+        # We need to ensure we are operating on the DataFrame after all previous steps
+        # (it is already in self.df)
+    
+        for frame in df['frame_idx'].unique():
+            frame_mask = df['frame_idx'] == frame
+    
+            shoulder_rows = df[frame_mask & (df['position_name'] == 'shoulder')]
+            elbow_rows = df[frame_mask & (df['position_name'] == 'elbow')]
+    
+            if len(shoulder_rows) == 0 or len(elbow_rows) == 0:
+                continue
+    
+            shoulder = shoulder_rows[['x','y','z']].values[0]
+            elbow = elbow_rows[['x','y','z']].values[0]
+    
+            vec = elbow - shoulder
+            dist = np.linalg.norm(vec)
+    
+            if dist < 1e-9:   # degenerate, skip
+                continue
+    
+            direction = vec / dist
+            corrected_elbow = shoulder + direction * self.TRUE_UPPER_ARM_LENGTH
+    
+            elbow_idx = elbow_rows.index[0]
+            df.loc[elbow_idx, ['x','y','z']] = corrected_elbow
+            n_corrected += 1
+    
+        self.df = df
+        print(f"  Applied elbow position correction to {n_corrected} frames (target upper arm length = {self.TRUE_UPPER_ARM_LENGTH*100:.1f} cm)")
         return self.df
     
     def enforce_anatomical_constraints(self):
         """Enforce reasonable anatomical constraints between connected body parts"""
         if not self.enable_anatomical:
-            print("Skipping anatomical constraints (disabled)")
+            print("  Skipping anatomical constraints (disabled)")
             return self.df
             
         constraints_applied = 0
         
-        # Group by frame to work with complete poses
         for frame in self.df['frame_idx'].unique():
             frame_mask = self.df['frame_idx'] == frame
             
-            # Get positions for this frame
             bracelet = self.df[frame_mask & (self.df['position_name'] == 'bracelet')]
             elbow = self.df[frame_mask & (self.df['position_name'] == 'elbow')]
             shoulder = self.df[frame_mask & (self.df['position_name'] == 'shoulder')]
             
             if len(bracelet) > 0 and len(elbow) > 0:
-                # Calculate current bone lengths
                 bracelet_pos = bracelet[['x', 'y', 'z']].values[0]
                 elbow_pos = elbow[['x', 'y', 'z']].values[0]
                 
                 forearm_length = np.linalg.norm(bracelet_pos - elbow_pos)
                 
-                # Apply gentle constraints (forearm length ~0.3-0.5m typically)
-                if forearm_length > 0.6:  # Unusually long forearm
+                if forearm_length > 0.6:
                     direction = (bracelet_pos - elbow_pos) / forearm_length
-                    new_bracelet = elbow_pos + direction * 0.4  # Scale to reasonable length
+                    new_bracelet = elbow_pos + direction * 0.4
                     
                     bracelet_idx = bracelet.index[0]
                     self.df.loc[bracelet_idx, ['x', 'y', 'z']] = new_bracelet
@@ -299,7 +328,6 @@ class PoseSmoothingPipeline:
                 
                 upper_arm_length = np.linalg.norm(elbow_pos - shoulder_pos)
                 
-                # Apply gentle constraints (upper arm length ~0.3-0.5m typically)
                 if upper_arm_length > 0.6:
                     direction = (elbow_pos - shoulder_pos) / upper_arm_length
                     new_elbow = shoulder_pos + direction * 0.4
@@ -308,142 +336,191 @@ class PoseSmoothingPipeline:
                     self.df.loc[elbow_idx, ['x', 'y', 'z']] = new_elbow
                     constraints_applied += 1
         
-        print(f"Applied {constraints_applied} anatomical constraints")
+        print(f"  Applied {constraints_applied} anatomical constraints")
         return self.df
     
     def final_quality_check(self):
         """Perform final quality check and smoothing on confidence scores"""
         if not self.enable_quality_check:
-            print("Skipping quality check (disabled)")
+            print("  Skipping quality check (disabled)")
             return self.df
             
-        # Smooth confidence scores slightly
         for position in self.df['position_name'].unique():
             mask = self.df['position_name'] == position
             position_indices = self.df[mask].index
             
-            # Apply mild smoothing to confidence scores
             confidences = self.df.loc[position_indices, 'confidence'].values
             smoothed_conf = pd.Series(confidences).rolling(
                 window=3, center=True, min_periods=1
             ).mean()
             
-            # Ensure confidence stays in valid range
             smoothed_conf = smoothed_conf.clip(0, 100)
             self.df.loc[position_indices, 'confidence'] = smoothed_conf
         
-        print("Applied final quality check")
+        print("  Applied final quality check")
         return self.df
     
     def run_pipeline(self, input_file, output_file, verbose=True):
         """Execute the complete smoothing pipeline"""
         if verbose:
-            print("="*60)
-            print("POSE ESTIMATION SMOOTHING PIPELINE")
-            print("="*60)
-            print(f"Input:  {input_file}")
-            print(f"Output: {output_file}")
-            print("="*60)
-            print("\nConfiguration:")
-            print(f"  Window size: {self.window_size}")
-            print(f"  Outlier std threshold: {self.outlier_std}")
-            print(f"  Butterworth cutoff: {self.butter_cutoff} Hz")
-            print(f"  Butterworth order: {self.butter_order}")
-            print(f"  Min confidence: {self.min_confidence}%")
-            print(f"  FPS: {self.fps}")
-            print("\nEnabled steps:")
-            print(f"  Confidence filtering: {self.enable_confidence_filter}")
-            print(f"  Outlier removal: {self.enable_outlier_removal}")
-            print(f"  Interpolation: {self.enable_interpolation}")
-            print(f"  Confidence-weighted smoothing: {self.enable_confidence_weighted}")
-            print(f"  Butterworth filter: {self.enable_butterworth}")
-            print(f"  Anatomical constraints: {self.enable_anatomical}")
-            print(f"  Quality check: {self.enable_quality_check}")
-            print("\n" + "="*60)
+            print(f"\nProcessing: {os.path.basename(input_file)}")
+            print("-" * 40)
         
-        # Step 1: Load data
+        # Load data
         self.load_data(input_file)
         
-        # Step 2: Process
-        if verbose:
-            print("\nProcessing steps:")
-            
-        print(f"\n1. {'[SKIP]' if not self.enable_confidence_filter else ''} Confidence filtering...")
+        # Process
+        print("  1. Confidence filtering...")
         self.filter_low_confidence()
         
-        print(f"\n2. {'[SKIP]' if not self.enable_outlier_removal else ''} Outlier removal...")
+        print("  2. Outlier removal...")
         self.remove_outliers()
         
-        print(f"\n3. {'[SKIP]' if not self.enable_interpolation else ''} Interpolation...")
+        print("  3. Interpolation...")
         self.interpolate_missing()
         
-        print(f"\n4. {'[SKIP]' if not self.enable_confidence_weighted else ''} Confidence-weighted smoothing...")
+        print("  4. Confidence-weighted smoothing...")
         self.confidence_weighted_smooth()
         
-        print(f"\n5. {'[SKIP]' if not self.enable_butterworth else ''} Butterworth filter...")
+        print("  5. Butterworth filter...")
         self.butterworth_filter()
         
-        print(f"\n6. {'[SKIP]' if not self.enable_anatomical else ''} Anatomical constraints...")
+        print("  6. Anatomical constraints...")
         self.enforce_anatomical_constraints()
         
-        print(f"\n7. {'[SKIP]' if not self.enable_quality_check else ''} Quality check...")
+        print("  7. Quality check...")
         self.final_quality_check()
+
+        print("  8. Elbow position correction...")
+        self.correct_elbow_position()
         
         # Save processed data
         self.df.to_csv(output_file, index=False)
         
         if verbose:
-            print("\n" + "="*60)
-            print(f"✅ Processing complete! Output saved to: {output_file}")
-            print("="*60)
-            
-            # Print statistics
-            self.print_statistics()
+            print(f"  ✓ Saved to: {output_file}")
         
         return self.df
     
     def print_statistics(self):
         """Print processing statistics"""
-        print("\n" + "="*60)
-        print("SMOOTHING STATISTICS")
-        print("="*60)
+        print("\n  Smoothing Statistics:")
+        print("  " + "-" * 40)
         
         for position in self.df['position_name'].unique():
             orig_mask = self.original_df['position_name'] == position
             proc_mask = self.df['position_name'] == position
             
-            print(f"\n{position.upper()}:")
-            print("-" * 40)
+            print(f"  {position}:")
             
             for coord in ['x', 'y', 'z']:
                 orig_series = self.original_df.loc[orig_mask, coord]
                 proc_series = self.df.loc[proc_mask, coord]
                 
-                # Calculate smoothness metric (total variation)
                 orig_variation = orig_series.diff().abs().sum()
                 proc_variation = proc_series.diff().abs().sum()
                 
                 if orig_variation > 0:
                     reduction = ((orig_variation - proc_variation) / orig_variation) * 100
-                    print(f"  {coord}: Variation reduced by {reduction:5.1f}%")
+                    print(f"    {coord}: Variation reduced by {reduction:5.1f}%")
                 else:
-                    print(f"  {coord}: No variation in original data")
+                    print(f"    {coord}: No variation in original data")
+
+
+def generate_output_filename(input_path, output_arg):
+    """Generate output filename based on input path and output argument"""
+    input_path = Path(input_path)
+    
+    if output_arg:
+        output_path = Path(output_arg)
         
-        print("\n" + "="*60)
+        # If output is a directory, place file there with _smoothed suffix
+        if output_path.is_dir() or output_arg.endswith('/') or output_arg.endswith('\\'):
+            stem = input_path.stem
+            suffix = input_path.suffix
+            output_path = output_path / f"{stem}_smoothed{suffix}"
+        # If output is a file path, use it directly
+        else:
+            # If it doesn't have an extension, treat as directory
+            if not output_path.suffix:
+                stem = input_path.stem
+                suffix = input_path.suffix
+                output_path = output_path / f"{stem}_smoothed{suffix}"
+    else:
+        # Default: append _smoothed before extension
+        stem = input_path.stem
+        suffix = input_path.suffix
+        output_path = input_path.parent / f"{stem}_smoothed{suffix}"
+    
+    # Create parent directories if they don't exist
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    return str(output_path)
+
+
+def expand_file_patterns(patterns):
+    """Expand wildcard patterns and return list of files"""
+    files = []
+    
+    for pattern in patterns:
+        # Expand the pattern
+        matched_files = glob.glob(pattern)
+        
+        if not matched_files:
+            print(f"⚠️  Warning: No files found matching pattern: {pattern}")
+            continue
+        
+        # Filter to only CSV files
+        csv_files = [f for f in matched_files if f.lower().endswith('.csv')]
+        
+        if not csv_files:
+            print(f"⚠️  Warning: No CSV files found matching pattern: {pattern}")
+            continue
+        
+        files.extend(csv_files)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_files = []
+    for f in files:
+        abs_path = os.path.abspath(f)
+        if abs_path not in seen:
+            seen.add(abs_path)
+            unique_files.append(f)
+    
+    return unique_files
 
 
 def create_parser():
     """Create argument parser with detailed help"""
     parser = argparse.ArgumentParser(
-        description='Smooth pose estimation data from CSV files',
+        description='Smooth pose estimation data from CSV files (supports wildcards)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Process a single file
   %(prog)s pose_data.csv
+  
+  # Process with custom output
   %(prog)s pose_data.csv -o smoothed_poses.csv
-  %(prog)s pose_data.csv --min-confidence 50 --window-size 7
-  %(prog)s pose_data.csv --disable-anatomical --disable-butterworth
-  %(prog)s pose_data.csv --butter-cutoff 4 --outlier-std 2.5
+  
+  # Process multiple files with wildcard
+  %(prog)s "camera0_20260425_*_poses.csv"
+  
+  # Process all CSV files in a directory
+  %(prog)s "data/*.csv" -o smoothed/
+  
+  # Process multiple patterns
+  %(prog)s "camera0_*.csv" "camera1_*.csv" -o output/
+  
+  # Custom parameters with wildcard
+  %(prog)s "data/*_poses.csv" --min-confidence 50 --window-size 7
+  
+  # Disable specific steps for all files
+  %(prog)s "*.csv" --disable-anatomical --disable-butterworth
+  
+  # Multiple explicit files
+  %(prog)s file1.csv file2.csv file3.csv -o smoothed/
 
 For more information, see the documentation.
         """
@@ -451,17 +528,18 @@ For more information, see the documentation.
     
     # Required arguments
     parser.add_argument(
-        'input_file',
+        'input_patterns',
         type=str,
-        help='Path to input CSV file with pose estimation data'
+        nargs='+',
+        help='Input CSV file(s) or wildcard pattern(s) (e.g., "camera0_*.csv")'
     )
     
-    # Output file
+    # Output file/directory
     parser.add_argument(
-        '-o', '--output-file',
+        '-o', '--output',
         type=str,
         default=None,
-        help='Path to output CSV file (default: input_file_smoothed.csv)'
+        help='Output file or directory (default: input_smoothed.csv)'
     )
     
     # Filter parameters
@@ -553,7 +631,30 @@ For more information, see the documentation.
         action='store_true',
         help='Do not print smoothing statistics'
     )
-    
+    other_group.add_argument(
+        '--list-only',
+        action='store_true',
+        help='Only list files that would be processed, without processing them'
+    )
+    # In the "Other Options" group
+    other_group.add_argument(
+        '--correct-elbow',
+        action='store_true',
+        help='Extrapolate elbow tag position to known upper arm length'
+    )
+    other_group.add_argument(
+        '--true-upper-arm',
+        type=float,
+        default=14.0,
+        help='True upper arm length in inches (default: 14.0)'
+    )
+    other_group.add_argument(
+        '--true-forearm',
+        type=float,
+        default=10.0,
+        help='True forearm length in inches (default: 10.0)'
+    )
+
     return parser
 
 
@@ -561,21 +662,6 @@ def main():
     """Main entry point for command-line usage"""
     parser = create_parser()
     args = parser.parse_args()
-    
-    # Validate input file exists
-    input_path = Path(args.input_file)
-    if not input_path.exists():
-        print(f"❌ Error: Input file not found: {args.input_file}")
-        sys.exit(1)
-    
-    # Generate output filename if not provided
-    if args.output_file:
-        output_path = Path(args.output_file)
-    else:
-        # Append '_smoothed' before the extension
-        stem = input_path.stem
-        suffix = input_path.suffix
-        output_path = input_path.parent / f"{stem}_smoothed{suffix}"
     
     # Validate parameters
     if args.min_confidence < 0 or args.min_confidence > 100:
@@ -602,41 +688,102 @@ def main():
         print("❌ Error: fps must be positive")
         sys.exit(1)
     
-    # Initialize pipeline with command-line arguments
-    pipeline = PoseSmoothingPipeline(
-        window_size=args.window_size,
-        outlier_std=args.outlier_std,
-        butter_cutoff=args.butter_cutoff,
-        butter_order=args.butter_order,
-        min_confidence=args.min_confidence,
-        fps=args.fps,
-        disable_confidence_filter=args.disable_confidence_filter,
-        disable_outlier_removal=args.disable_outlier_removal,
-        disable_interpolation=args.disable_interpolation,
-        disable_confidence_weighted=args.disable_confidence_weighted,
-        disable_butterworth=args.disable_butterworth,
-        disable_anatomical=args.disable_anatomical,
-        disable_quality_check=args.disable_quality_check
-    )
+    # Expand file patterns
+    input_files = expand_file_patterns(args.input_patterns)
     
-    # Run the pipeline
-    try:
-        smoothed_df = pipeline.run_pipeline(
-            input_file=str(input_path),
-            output_file=str(output_path),
-            verbose=not args.quiet
-        )
-        
-        if not args.quiet and not args.no_stats:
-            pass  # Statistics are already printed in run_pipeline
-            
-        print(f"\n✅ Successfully processed {len(smoothed_df)} data points")
-        
-    except Exception as e:
-        print(f"\n❌ Error during processing: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    if not input_files:
+        print("❌ Error: No CSV files found matching the specified patterns")
         sys.exit(1)
+    
+    # If --list-only flag is set, just print the files and exit
+    if args.list_only:
+        print(f"\nFound {len(input_files)} file(s) to process:")
+        for i, f in enumerate(input_files, 1):
+            print(f"  {i}. {f}")
+        return
+    
+    # Print header
+    if not args.quiet:
+        print("="*60)
+        print("POSE ESTIMATION SMOOTHING PIPELINE")
+        print("="*60)
+        print(f"\nConfiguration:")
+        print(f"  Window size: {args.window_size}")
+        print(f"  Outlier std threshold: {args.outlier_std}")
+        print(f"  Butterworth cutoff: {args.butter_cutoff} Hz")
+        print(f"  Butterworth order: {args.butter_order}")
+        print(f"  Min confidence: {args.min_confidence}%")
+        print(f"  FPS: {args.fps}")
+        print(f"\nEnabled steps:")
+        print(f"  Confidence filtering: {not args.disable_confidence_filter}")
+        print(f"  Outlier removal: {not args.disable_outlier_removal}")
+        print(f"  Interpolation: {not args.disable_interpolation}")
+        print(f"  Confidence-weighted smoothing: {not args.disable_confidence_weighted}")
+        print(f"  Butterworth filter: {not args.disable_butterworth}")
+        print(f"  Anatomical constraints: {not args.disable_anatomical}")
+        print(f"  Quality check: {not args.disable_quality_check}")
+        print(f"\nFound {len(input_files)} file(s) to process:")
+        for f in input_files:
+            print(f"  • {f}")
+        print("\n" + "="*60)
+    
+    # Process each file
+    successful = 0
+    failed = 0
+    
+    for input_file in input_files:
+        try:
+            # Generate output filename
+            output_file = generate_output_filename(input_file, args.output)
+            
+            # Initialize pipeline
+            pipeline = PoseSmoothingPipeline(
+                window_size=args.window_size,
+                outlier_std=args.outlier_std,
+                butter_cutoff=args.butter_cutoff,
+                butter_order=args.butter_order,
+                min_confidence=args.min_confidence,
+                fps=args.fps,
+                disable_confidence_filter=args.disable_confidence_filter,
+                disable_outlier_removal=args.disable_outlier_removal,
+                disable_interpolation=args.disable_interpolation,
+                disable_confidence_weighted=args.disable_confidence_weighted,
+                disable_butterworth=args.disable_butterworth,
+                disable_anatomical=args.disable_anatomical,
+                disable_quality_check=args.disable_quality_check,
+                enable_elbow_correction=args.correct_elbow,           # was: args.corrected_elbow
+                true_upper_arm_length_in=args.true_upper_arm,         # was missing
+                true_forearm_length=args.true_forearm                 # was missing
+            )
+            
+            # Run pipeline
+            pipeline.run_pipeline(
+                input_file=input_file,
+                output_file=output_file,
+                verbose=not args.quiet
+            )
+            
+            if not args.quiet and not args.no_stats:
+                pipeline.print_statistics()
+            
+            successful += 1
+            
+        except Exception as e:
+            print(f"\n❌ Error processing {input_file}: {str(e)}")
+            if not args.quiet:
+                import traceback
+                traceback.print_exc()
+            failed += 1
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("PROCESSING SUMMARY")
+    print("="*60)
+    print(f"  Total files: {len(input_files)}")
+    print(f"  Successful:  {successful} ✅")
+    if failed > 0:
+        print(f"  Failed:      {failed} ❌")
+    print("="*60)
 
 
 if __name__ == "__main__":

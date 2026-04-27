@@ -1,3 +1,5 @@
+import os
+import sys
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import pandas as pd
@@ -6,7 +8,23 @@ import numpy as np
 # -------------------------------
 # 1. Load the data from your file
 # -------------------------------
-file_path = "pose_data_smoothed.csv"
+
+file_path = None
+
+# Get file path from command line argument, or use default
+if len(sys.argv) > 1:
+    file_path = sys.argv[1]
+else:
+    print(f"Error: Filepath not provided.")
+    sys.exit(1)
+
+# Check if file exists
+if not os.path.exists(file_path):
+    print(f"Error: File '{file_path}' not found.")
+    print(f"Usage: python {sys.argv[0]} <path_to_csv>")
+    sys.exit(1)
+
+print(f"Loading: {file_path}")
 df = pd.read_csv(file_path)
 
 # Make sure the joints are plotted in a fixed order
