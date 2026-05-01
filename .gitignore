@@ -4,6 +4,8 @@ __pycache__/
 .*/
 calib_images/
 iframe_figures/
+*.prof
+flamegraph.svg
 pose_estimate.py
 pose_estimate_2.py
 __MACOSX/
