@@ -4,6 +4,9 @@ __pycache__/
 .*/
 calib_images/
 iframe_figures/
+*.prof
+*.chat
+flamegraph.svg
 pose_estimate.py
 pose_estimate_2.py
 __MACOSX/
