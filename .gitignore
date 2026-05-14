@@ -13,6 +13,5 @@ __MACOSX/
 recordings425.zip
 recordings/
 training_data/
-obsolete/
 pose_data.csv
 pose_data_smoothed.csv
