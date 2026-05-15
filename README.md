@@ -80,26 +80,57 @@ Optional: `playback_mode.py` for tuning detector params on a recorded clip,
 
 ### 2. Preprocess into model-ready data (`data_preprocess.ipynb`)
 
-Set `time_stamp` in the config cell to the session you want, then run all.
-The notebook is organized as collapsible stages (use JupyterLab's
-heading-collapse to focus on one stage at a time):
+The notebook is organized as a pipeline: one pure function per stage, each
+in its own cell behind a markdown header. Functions take a `PreprocessParams`
+dataclass and explicit inputs; they don't read module globals.
 
-1. Load raw pose + EMG + EMG packet timestamps
-2. Pose → wide per-frame format → 4-DOF joint angles via inverse kinematics
-3. EMG ingest: uniform timeline + active-channel detection
-4. Pose/EMG overlap window (shared by all downstream stages)
-5. EMG conditioning: normalize → rectify → lowpass → z-score
-6. Pose alignment: trim and upsample joints to the EMG rate
-7. Assemble `df_model = [time, <EMG channels>, q1..q4]`
-   - **7b. Arm reconstruction sanity check** — animated 3D arm overlay
-     (ground-truth pose vs FK from IK joints). Useful for catching
-     IK/FK convention drift before training.
-8. Save → `training_data/training_data_{time_stamp}.csv`
+**Run all sessions (default):** just *Run All*. The last cell calls
+`run_batch()`, which auto-discovers every session under `recordings/` via
+`discover_timestamps()` (sessions missing any of pose-smoothed / EMG / EMG
+timestamps are skipped) and runs the pipeline on each. For any session whose
+`training_data_{ts}.csv` already exists you'll get a prompt:
+
+| key | action |
+|-----|--------|
+| `y` | re-run this one |
+| `n` *(default)* | skip this one |
+| `a` | re-run this and all subsequent already-existing ones |
+| `s` | skip this and all subsequent already-existing ones |
+| `q` | abort the batch |
+
+**Run on a single session or a custom list:** call `run_batch` directly, e.g.
+
+```python
+run_batch(timestamps=['20260425_013519'])                          # one session
+run_batch(timestamps=['20260425_013519', '20260425_013607'])       # a few
+preprocess_session('20260425_013519', PreprocessParams(...))       # bypass batch
+```
+
+Stages (each is one function = one cell):
+
+1. `load_session` — raw pose + EMG + EMG packet timestamps
+2. `pose_to_wide` + `compute_joint_angles` — wide format → 4-DOF joint angles
+   via inverse kinematics
+3. `emg_timeline` + `detect_active_channels` — uniform timeline; drop
+   flat-zero channels
+4. `overlap_window` — pose/EMG overlap masks shared by all downstream stages
+5. `condition_emg` — normalize → rectify → lowpass → z-score
+6. `upsample_joints` — trim pose and interpolate joints onto EMG timestamps
+7. `assemble_df_model` → `df_model = [time, <EMG channels>, q1..q4]`
+   - **7b. `arm_sanity_animation`** — 3D arm overlay (ground-truth pose vs
+     FK from IK joints). Useful for catching IK/FK convention drift before
+     training.
+8. `save_training_data` → `training_data/training_data_{time_stamp}.csv`
 
 All knobs (arm geometry, EMG filter cutoffs, active-channel threshold,
-EMG/pose offset, visualization downsample, etc.) are at the top of the
-config cell. Intermediate plots and previews are gated behind
-`DISPLAY_INTERMEDIATE`.
+EMG/pose offset, visualization downsample, etc.) live on the
+`PreprocessParams` dataclass. Two diagnostic flags worth knowing:
+
+- `display_intermediate` — per-stage previews and plots. **Off by default in
+  the batch cell** (would produce dozens of plots); flip on (or call
+  `preprocess_session` directly) for interactive single-session work.
+- `show_sanity_animation` — runs the §7b 3D animation. Off in batch mode for
+  the same reason.
 
 ### 3. Train + evaluate (`model_training.ipynb`)
 
